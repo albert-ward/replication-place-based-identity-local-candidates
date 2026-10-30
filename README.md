@@ -1,7 +1,6 @@
 # Replication materials
 
 **Place-Based Identity and the Demand for Local Candidates**
-*Journal of Politics*
 
 ## Overview
 
