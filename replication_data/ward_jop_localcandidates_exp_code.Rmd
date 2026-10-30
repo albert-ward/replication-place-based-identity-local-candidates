@@ -1,0 +1,1141 @@
+---
+title: "Main code"
+author: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: spacelab
+    highlight: textmate
+    code_folding: hide
+editor_options:
+  chunk_output_type: inline
+---
+
+<style> body {text-align: justify} </style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+<br />
+
+## Packages
+
+```{r}
+# Packages
+library(tidyverse)
+library(broom)
+library(estimatr)
+library(cregg)
+library(marginaleffects)
+library(ggforce)
+
+# Tables
+library(modelsummary)
+library(texreg)
+```
+
+<br />
+
+# Cleaning
+
+```{r, cleaning}
+# Read
+exp_data <- read_csv("ward_jop_localcandidates_exp_data.csv")
+
+# Clean and rename
+exp_data <- rename(exp_data, "duration" = "Duration (in seconds)")
+names(exp_data) <- tolower(names(exp_data))
+exp_data <- rename(exp_data, resp_race = race, resp_education = education)
+
+# Treatment group: participants who saw the neighborhood prime have a treatment reflection
+exp_data <- exp_data %>%
+  mutate(treatment_group = !is.na(treatment))
+
+# Party including leaners (pid2 asked of independents and others). Sets the primary shown
+exp_data <- exp_data %>%
+  mutate(pid_lean = case_when(
+    is.na(pid2) ~ pid1,
+    !is.na(pid2) ~ pid2
+  ))
+
+# Candidate gender, from the name shown on each profile
+MaleNames <- c("James", "Michael", "William", "John", "David")
+FemaleNames <- c("Susan", "Jennifer", "Emily", "Olivia", "Barbara")
+
+get_gender <- function(name) {
+  # Remove anything in parentheses, then trim whitespace and lowercase
+  clean_name <- trimws(tolower(gsub("\\s*\\(.*\\)", "", name)))
+
+  if (clean_name %in% tolower(MaleNames)) {
+    return("Male")
+  } else if (clean_name %in% tolower(FemaleNames)) {
+    return("Female")
+  } else {
+    return(NA)
+  }
+}
+
+rounds <- 1:3
+for (r in rounds) {
+  prof1_col <- paste0("profile1_round", r)
+  prof2_col <- paste0("profile2_round", r)
+
+  gender1_col <- paste0("profile1_gender_round", r)
+  gender2_col <- paste0("profile2_gender_round", r)
+
+  exp_data[[gender1_col]] <- sapply(exp_data[[prof1_col]], get_gender)
+  exp_data[[gender2_col]] <- sapply(exp_data[[prof2_col]], get_gender)
+}
+
+# Respondent-level variables, carried onto every profile row
+respondent_vars <- exp_data %>%
+  select(-starts_with("profile"), -starts_with("chosen_profile")) %>%
+  names()
+
+# Reshape one round and task to long format: two rows, one per profile
+reshape_round_task <- function(df, round_num, task_suffix) {
+  chosen_col <- paste0("chosen_profile_", task_suffix, "_round", round_num)
+  prof1_name_col <- paste0("profile1_round", round_num)
+  prof2_name_col <- paste0("profile2_round", round_num)
+
+  df %>%
+    rowwise() %>%
+    do({
+      respondent_row <- .
+
+      # Chosen profile
+      chosen_val <- respondent_row[[chosen_col]]
+      prof1_name <- respondent_row[[prof1_name_col]]
+      prof2_name <- respondent_row[[prof2_name_col]]
+
+      base_data <- respondent_row[respondent_vars]
+
+      tibble(
+        profile = c(1, 2),
+        profile_name = c(prof1_name, prof2_name),
+        chosen = c(chosen_val == prof1_name, chosen_val == prof2_name),
+        education = c(
+          respondent_row[[paste0("profile1_education_round", round_num)]],
+          respondent_row[[paste0("profile2_education_round", round_num)]]
+        ),
+        race = c(
+          respondent_row[[paste0("profile1_race_round", round_num)]],
+          respondent_row[[paste0("profile2_race_round", round_num)]]
+        ),
+        gender = c(
+          respondent_row[[paste0("profile1_gender_round", round_num)]],
+          respondent_row[[paste0("profile2_gender_round", round_num)]]
+        ),
+        family_ties = c(
+          respondent_row[[paste0("profile1_family_ties_round", round_num)]],
+          respondent_row[[paste0("profile2_family_ties_round", round_num)]]
+        ),
+        residence_length_as_adult = c(
+          respondent_row[[paste0("profile1_residence_length_as_adult_round", round_num)]],
+          respondent_row[[paste0("profile2_residence_length_as_adult_round", round_num)]]
+        ),
+        birthplace = c(
+          respondent_row[[paste0("profile1_birthplace_round", round_num)]],
+          respondent_row[[paste0("profile2_birthplace_round", round_num)]]
+        ),
+        residence = c(
+          respondent_row[[paste0("profile1_residence_round", round_num)]],
+          respondent_row[[paste0("profile2_residence_round", round_num)]]
+        ),
+        political_experience = c(
+          respondent_row[[paste0("profile1_political_experience_round", round_num)]],
+          respondent_row[[paste0("profile2_political_experience_round", round_num)]]
+        ),
+        round = round_num,
+        task = task_suffix
+      ) %>%
+        bind_cols(base_data)
+    }) %>%
+    ungroup()
+}
+
+# 3 rounds x 2 tasks, so 12 profile rows per respondent
+all_long <- map_dfr(1:3, function(r) {
+  bind_rows(
+    reshape_round_task(exp_data, r, "q1"),
+    reshape_round_task(exp_data, r, "q2")
+  )
+})
+
+# Congressman and Congresswoman combined
+all_long <- all_long %>%
+  mutate(
+    political_experience = case_when(
+      political_experience == "Congressman" | political_experience == "Congresswoman" ~ "Congress",
+      TRUE ~ political_experience
+    )
+  )
+
+# Reference levels
+all_long <- all_long %>%
+  mutate(
+    education = factor(education, levels = c("High school diploma", "Bachelor's degree")),
+    race = factor(race, levels = c("White", "Black", "Hispanic")),
+    family_ties = factor(family_ties, levels = c(
+      "No extended family live in the neighborhood",
+      "Some extended family live in the neighborhood",
+      "Most extended family live in the neighborhood"
+    )),
+    residence_length_as_adult = factor(residence_length_as_adult, levels = c(
+      "Just moved to the neighborhood",
+      "Lived in the neighborhood for 5 years",
+      "Lived in the neighborhood for 20 years"
+    )),
+    birthplace = factor(birthplace, levels = c("Not born in the neighborhood", "Born in the neighborhood")),
+    residence = factor(residence, levels = c("Rents a house in the neighborhood", "Owns a house in the neighborhood")),
+    political_experience = factor(political_experience, levels = c("None", "State legislator", "Congress")),
+    gender = factor(gender, levels = c("Male", "Female"))
+  )
+
+all_long <- all_long %>%
+  mutate(chosen = as.numeric(chosen))
+
+all_long <- all_long %>%
+  mutate(
+    pid_lean = factor(pid_lean, levels = c(
+      "Neither",
+      "Democrat",
+      "Republican"
+    ))
+  )
+
+# Urbanicity from RUCA codes. 99 (not coded) is NA
+all_long <- mutate(all_long,
+  rural_urban_ruca = case_when(
+    ruca1 == 1 | ruca1 == 2 | ruca1 == 3 ~ "City",
+    ruca1 == 4 | ruca1 == 5 | ruca1 == 6 ~ "Large town",
+    ruca1 == 7 | ruca1 == 8 | ruca1 == 9 ~ "Town",
+    ruca1 == 10 ~ "Rural",
+  )
+)
+
+all_long <- all_long %>%
+  mutate(
+    rural_urban_simplified = factor(rural_urban_ruca, levels = c(
+      "Rural",
+      "Town",
+      "Large town",
+      "City"
+    ))
+  )
+```
+
+<br />
+
+# Data and methods
+
+<br />
+
+### Exclusion criteria
+
+```{r, exclusions}
+# Bottom decile of reflection length, by condition (124 and 84 characters)
+quantile(nchar(all_long$treatment), probs = c(0.10), na.rm = TRUE)
+quantile(nchar(all_long$control), probs = c(0.10), na.rm = TRUE)
+
+all_long <- all_long %>%
+  mutate(short_text = case_when(
+    nchar(treatment) < 124 | nchar(control) < 84 ~ 1,
+    TRUE ~ 0
+  ))
+
+exp_data <- exp_data %>%
+  mutate(short_text = case_when(
+    nchar(treatment) < 124 | nchar(control) < 84 ~ 1,
+    TRUE ~ 0
+  ))
+
+# Q1 is personal preference, Q2 electability. Models use Q1 unless stated
+all_long_q1 <- all_long %>% filter(task == "q1")
+
+# Upper duration limit: three standard deviations above the mean
+mean_x <- mean(all_long$duration, na.rm = T)
+sd_x <- sd(all_long$duration, na.rm = T)
+threshold <- mean_x + 3 * sd_x
+
+# Exclusion criteria
+all_long_q1_restricted <- all_long_q1 %>%
+  filter(duration >= 60, duration <= threshold, gpt_answer == 0, short_text == 0, q_recaptchascore > 0.4, attention_check == "Strongly disagree")
+all_long_restricted <- all_long %>%
+  filter(duration >= 60, duration <= threshold, gpt_answer == 0, short_text == 0, q_recaptchascore > 0.4, attention_check == "Strongly disagree")
+exp_data_restricted <- exp_data %>%
+  filter(duration >= 60, duration <= threshold, gpt_answer == 0, short_text == 0, q_recaptchascore > 0.4, attention_check == "Strongly disagree")
+
+# Model 1 (primary): exclusions, rounds 1-2. Model 2: exclusions, all rounds. Model 3: no exclusions, rounds 1-2. Model 4: no exclusions, all rounds
+all_long_q1_restricted_r12 <- all_long_q1_restricted %>% filter(round == 1 | round == 2)
+all_long_restricted_r12 <- all_long_restricted %>% filter(round == 1 | round == 2)
+all_long_q1_full_r12 <- all_long_q1 %>% filter(round == 1 | round == 2)
+
+# Exclusions by criterion (respondents may fail more than one)
+exp_data %>%
+  summarise(
+    recruited = n(),
+    duration_short = sum(duration < 60),
+    duration_long = sum(duration > threshold),
+    gpt_answer = sum(gpt_answer != 0),
+    short_text = sum(short_text == 1),
+    recaptcha = sum(q_recaptchascore <= 0.4),
+    attention_check = sum(attention_check != "Strongly disagree" | is.na(attention_check)),
+    excluded = n() - nrow(exp_data_restricted)
+  ) %>%
+  print(width = Inf)
+```
+
+```{r, short labels}
+# Short level labels for the marginal means tables and Figure 2. Primary specification
+mm_data <- all_long_q1_restricted_r12 %>%
+  mutate(
+    family_ties = dplyr::recode(family_ties,
+      "No extended family live in the neighborhood" = "No extended family",
+      "Some extended family live in the neighborhood" = "Some extended family",
+      "Most extended family live in the neighborhood" = "Most extended family"
+    ),
+    residence_length_as_adult = dplyr::recode(residence_length_as_adult,
+      "Just moved to the neighborhood" = "Just moved",
+      "Lived in the neighborhood for 5 years" = "Lived 5 years",
+      "Lived in the neighborhood for 20 years" = "Lived 20 years"
+    ),
+    birthplace = dplyr::recode(birthplace,
+      "Not born in the neighborhood" = "Not born",
+      "Born in the neighborhood" = "Born"
+    ),
+    residence = dplyr::recode(residence,
+      "Rents a house in the neighborhood" = "Rents",
+      "Owns a house in the neighborhood" = "Owns"
+    )
+  )
+```
+
+<br />
+
+### Sample
+
+```{r, sample}
+# Recruited sample
+nrow(exp_data)
+prop.table(table(exp_data$resp_gender)) * 100
+median(exp_data$age, na.rm = T)
+range(exp_data$age, na.rm = T)
+prop.table(table(exp_data$pid_lean)) * 100
+prop.table(table(exp_data$resp_race)) * 100 # Excludes NA by default
+mean(str_detect(exp_data$resp_education, "Bachelor|Graduate")) * 100
+mean(exp_data$hh_income %in% c("$50,000-$74,999", "$75,000-$99,999", "$100,000-$149,999", "$150,000 or more")) * 100
+median(exp_data$duration) / 60
+
+# Completes by condition, against equal assignment probability
+table(exp_data$treatment_group)
+binom.test(sum(exp_data$treatment_group), nrow(exp_data), p = 0.5)
+
+```
+
+<br />
+
+### Table A.7: Exclusions
+
+```{r, exclusions table}
+# Exclusions by criterion and condition (respondents may fail more than one)
+stopifnot(!anyDuplicated(exp_data$responseid))
+exclusions <- exp_data %>%
+  group_by(treatment_group) %>%
+  summarise(
+    completed = n(),
+    duration_short = sum(duration < 60),
+    duration_long = sum(duration > threshold),
+    gpt_answer = sum(gpt_answer != 0),
+    short_text = sum(short_text == 1),
+    recaptcha = sum(q_recaptchascore <= 0.4),
+    attention_check = sum(attention_check != "Strongly disagree" | is.na(attention_check)),
+    retained = sum(responseid %in% exp_data_restricted$responseid)
+  ) %>%
+  mutate(excluded = completed - retained)
+exclusions <- bind_rows(exclusions, summarise(exclusions, across(-treatment_group, sum)))
+stopifnot(exclusions$completed[3] == nrow(exp_data), exclusions$retained[3] == nrow(exp_data_restricted))
+print(exclusions, width = Inf)
+```
+
+<br />
+
+### Tables A.8 and A.9: Balance
+
+```{r, balance checks}
+# Respondent characteristics (Table A.8) and conjoint attributes (Table A.9)
+balance_respondent <- c("resp_race", "resp_education", "hh_income", "pid_lean", "age", "resp_gender", "state")
+balance_conjoint <- c("family_ties", "residence_length_as_adult", "race", "birthplace", "residence", "political_experience", "education", "gender")
+treatment_var <- "treatment_group"
+
+# t-test for numeric variables, chi-square otherwise. Std diff is Cramer's V for categorical variables
+balance_check <- function(data, treatment, covariates) {
+  results <- list()
+
+  for (var in covariates) {
+    if (is.numeric(data[[var]])) {
+      # For continuous variables. t is treatment minus control
+      treat_vals <- data[data[[treatment]] == TRUE, var, drop = TRUE]
+      control_vals <- data[data[[treatment]] == FALSE, var, drop = TRUE]
+      test <- t.test(treat_vals, control_vals)
+
+      mean_treat <- mean(treat_vals, na.rm = TRUE)
+      mean_control <- mean(control_vals, na.rm = TRUE)
+
+      # Calculate standardized difference
+      sd_pooled <- sqrt((var(treat_vals, na.rm = TRUE) + var(control_vals, na.rm = TRUE)) / 2)
+      std_diff <- (mean_treat - mean_control) / sd_pooled
+
+      # Add to results
+      result <- tidy(test)
+      result$mean_treat <- mean_treat
+      result$mean_control <- mean_control
+      result$std_diff <- std_diff
+
+      results[[var]] <- result
+
+    } else {
+      # For categorical variables
+      tbl <- table(data[[var]], data[[treatment]])
+      test <- chisq.test(tbl)
+
+      # Calculate Cramer's V for standardized difference
+      n <- sum(tbl)
+      cramers_v <- sqrt(test$statistic / (n * (min(nrow(tbl), ncol(tbl)) - 1)))
+
+      # For categorical variables, use the proportion in most common category
+      props <- prop.table(tbl, margin = 2)
+
+      # Get modal proportions
+      modal_treat <- max(props[,2])
+      modal_control <- max(props[,1])
+
+      # Add to results
+      result <- tidy(test)
+      result$mean_treat <- modal_treat  # Proportion in most common category
+      result$mean_control <- modal_control
+      result$std_diff <- cramers_v
+
+      results[[var]] <- result
+    }
+  }
+
+  # Combine all results
+  bind_rows(results, .id = "Variable")
+}
+balance_results <- balance_check(exp_data_restricted, treatment_var, balance_respondent)
+balance_results_conjoint <- balance_check(all_long_q1_restricted, treatment_var, balance_conjoint)
+
+# Format the table
+balance_table <- balance_results %>%
+  select(Variable, mean_treat, mean_control, std_diff, statistic, p.value) %>%
+  mutate(
+    # Format numeric values - determine type based on variable name
+    mean_treat = case_when(
+      Variable %in% c("age", "duration") ~ sprintf("%.1f", mean_treat),
+      # For categorical variables, show as percentage
+      TRUE ~ ifelse(mean_treat < 1, sprintf("%.0f%%", mean_treat*100), sprintf("%.1f", mean_treat))
+    ),
+    mean_control = case_when(
+      Variable %in% c("age", "duration") ~ sprintf("%.1f", mean_control),
+      # For categorical variables, show as percentage
+      TRUE ~ ifelse(mean_control < 1, sprintf("%.0f%%", mean_control*100), sprintf("%.1f", mean_control))
+    ),
+    std_diff = sprintf("%.2f", std_diff),
+    statistic = sprintf("%.1f", statistic),
+    p.value = sprintf("%.2f", p.value)
+  )
+
+balance_table
+balance_results_conjoint
+```
+
+<br />
+
+### Manipulation check
+
+```{r, manipulation check}
+# Belonging item as a number, 5 = strongly agree. Don't know is NA
+likert_code <- function(x) {
+  case_when(
+    x == "Strongly agree" ~ 5,
+    x == "Agree" ~ 4,
+    x == "Neither agree nor disagree" ~ 3,
+    x == "Disagree" ~ 2,
+    x == "Strongly disagree" ~ 1,
+    x == "Don't know" ~ NA_real_
+  )
+}
+
+variable_names <- c("manipulation_check_1")
+
+exp_data_restricted <- exp_data_restricted %>%
+  mutate(across(all_of(variable_names), likert_code))
+
+# Condition by response, sample after exclusions. Asked after all three conjoint rounds
+contingency_table <- table(exp_data_restricted$treatment_group, exp_data_restricted$manipulation_check_1)
+chi_squared_test <- chisq.test(contingency_table)
+print(chi_squared_test)
+
+# Effect size: Cramer's V
+cramers_v <- function(chisq_result, n, minDim) {
+  sqrt(chisq_result$statistic / (n * (minDim - 1)))
+}
+
+n <- sum(contingency_table) # Total number of observations
+minDim <- min(nrow(contingency_table), ncol(contingency_table)) # Minimum dimension of table
+
+v <- cramers_v(chi_squared_test, n, minDim)
+print(v)
+```
+
+<br />
+
+### Pilot study
+
+```{r, pilot}
+# Pilot, March 2025. Same vignettes, belonging item asked straight after the prime
+pilot <- read.csv("ward_jop_pilot_data.csv")
+
+# Pilot codes run 1 = strongly agree to 5 = strongly disagree. Reverse to match the main study, don't know (6) is NA
+reverse_code <- function(x) {
+  case_when(
+    x == 1 ~ 5,
+    x == 2 ~ 4,
+    x == 3 ~ 3,
+    x == 4 ~ 2,
+    x == 5 ~ 1,
+    x == 6 ~ NA_real_
+  )
+}
+
+pilot <- pilot %>%
+  mutate(across(all_of(c("Q5_1")), reverse_code))
+
+# Sample
+table(pilot$Group)
+
+# Drop the one participant without an answer, then test condition by response
+pilot_complete <- subset(pilot, !is.na(Group) & !is.na(Q5_1))
+contingency_table_pilot <- table(pilot_complete$Group, pilot_complete$Q5_1)
+chi_squared_test_pilot <- chisq.test(contingency_table_pilot)
+print(chi_squared_test_pilot)
+
+# Effect size, compared with the main study's in the text
+n_pilot <- sum(contingency_table_pilot) # Total number of observations
+minDim_pilot <- min(nrow(contingency_table_pilot), ncol(contingency_table_pilot)) # Minimum dimension of table
+
+v_pilot <- cramers_v(chi_squared_test_pilot, n_pilot, minDim_pilot)
+print(v_pilot)
+```
+
+<br />
+
+# Results
+
+<br />
+
+### Figure 1 and Table A.10: AMCEs
+
+```{r, AMCEs overall}
+# AMCEs: linear probability model of choice on all attributes, SEs clustered on respondent
+amce_model_q1 <- lm_robust(
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  data = all_long_q1_restricted_r12,
+  clusters = responseid
+)
+
+texreg(amce_model_q1, single.row = TRUE, include.ci = FALSE)
+
+# Figure 1: AMCEs with reference levels at zero
+amce_levels <- tribble(
+  ~Attribute, ~term, ~label,
+  "Family ties", NA, "No extended family",
+  "Family ties", "family_tiesSome extended family live in the neighborhood", "Some extended family",
+  "Family ties", "family_tiesMost extended family live in the neighborhood", "Most extended family",
+  "Birthplace", NA, "Not born in neighborhood",
+  "Birthplace", "birthplaceBorn in the neighborhood", "Born in neighborhood",
+  "Homeownership", NA, "Rents",
+  "Homeownership", "residenceOwns a house in the neighborhood", "Owns house",
+  "Length of residence", NA, "Just moved",
+  "Length of residence", "residence_length_as_adultLived in the neighborhood for 5 years", "Lived 5 years",
+  "Length of residence", "residence_length_as_adultLived in the neighborhood for 20 years", "Lived 20 years",
+  "Political experience", NA, "None",
+  "Political experience", "political_experienceState legislator", "State legislator",
+  "Political experience", "political_experienceCongress", "Congress",
+  "Education", NA, "High school diploma",
+  "Education", "educationBachelor's degree", "Bachelor's degree",
+  "Race", NA, "White",
+  "Race", "raceBlack", "Black",
+  "Race", "raceHispanic", "Hispanic",
+  "Gender", NA, "Male",
+  "Gender", "genderFemale", "Female"
+)
+stopifnot(all(na.omit(amce_levels$term) %in% tidy(amce_model_q1)$term))
+
+amce_plot_data <- amce_levels %>%
+  left_join(tidy(amce_model_q1), by = "term") %>%
+  mutate(
+    estimate = replace_na(estimate, 0),
+    Attribute = factor(Attribute, levels = unique(amce_levels$Attribute)),
+    label = factor(label, levels = rev(unique(label)))
+  )
+
+ggplot(amce_plot_data, aes(x = estimate * 100, y = label)) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = conf.low * 100, xmax = conf.high * 100), height = 0, linewidth = 0.5, na.rm = TRUE) +
+  geom_point(size = 2) +
+  ggforce::facet_col(vars(Attribute), scales = "free_y", space = "free") +
+  labs(x = "Change in probability of being chosen (percentage points)", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.text = element_text(colour = "black")
+  )
+
+ggsave("amce_overall_q1.pdf", width = 6, height = 7.5, units = "in")
+ggsave("amce_overall_q1.png", width = 6, height = 7.5, units = "in", dpi = 600, bg = "white")
+```
+
+<br />
+
+### Table A.11: Conditional AMCEs by treatment
+
+```{r, Conditional AMCEs by treatment}
+# Same model, estimated separately in each condition
+amce_treat_q1 <- lm_robust(
+  data = filter(all_long_q1_restricted_r12, treatment_group == TRUE),
+  formula = chosen ~ education + race + family_ties + gender +
+    birthplace + residence + residence_length_as_adult + political_experience,
+  clusters = responseid
+)
+
+amce_control_q1 <- lm_robust(
+  data = filter(all_long_q1_restricted_r12, treatment_group == FALSE),
+  formula = chosen ~ education + race + family_ties + gender +
+    birthplace + residence + residence_length_as_adult + political_experience,
+  clusters = responseid
+)
+
+texreg(list(amce_treat_q1, amce_control_q1), single.row = T, include.ci = FALSE)
+```
+
+<br />
+
+### Table A.12: Marginal means, full model and by treatment
+
+```{r, MM treatment}
+# Marginal means: share of profiles with each level that were chosen. Full sample and by condition
+cj_results_overall <- cj(
+  data = mm_data,
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm"
+) %>%
+  mutate(model = "Full model")
+
+cj_results_treatment <- cj(
+  data = filter(mm_data, treatment_group == TRUE),
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm"
+) %>%
+  mutate(model = "Treatment")
+
+cj_results_control <- cj(
+  data = filter(mm_data, treatment_group == FALSE),
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm"
+) %>%
+  mutate(model = "Control")
+
+mm_combined <- bind_rows(cj_results_overall, cj_results_treatment, cj_results_control) %>%
+  rename(term = level) %>%
+  mutate(
+    `Estimate (SE)` = sprintf("%.3f (%.3f)", estimate, std.error)
+  ) %>%
+  select(model, term, `Estimate (SE)`)
+
+# Side-by-side table
+table_wide <- tidyr::pivot_wider(
+  mm_combined,
+  names_from = model,
+  values_from = `Estimate (SE)`
+)
+
+modelsummary::datasummary_df(
+  table_wide,
+  title = "Marginal Means by Treatment Group",
+  output = "latex"
+)
+```
+
+<br />
+
+### Local candidate and carpetbagger probabilities
+
+```{r, conditional pred prob}
+# Logit on the same attributes, for predicted probabilities of named profiles
+fit_q1 <- glm(
+  chosen ~ education + race + gender + political_experience +
+           birthplace + residence + residence_length_as_adult + family_ties,
+  data = all_long_q1_restricted_r12,
+  family = binomial()
+)
+
+# Fully local and fully non-local profiles, otherwise identical
+local_profile <- tibble(
+  education = "Bachelor's degree",
+  race = "White",
+  gender = "Female",
+  political_experience = "Congress",
+  birthplace = "Born in the neighborhood",
+  residence = "Owns a house in the neighborhood",
+  residence_length_as_adult = "Lived in the neighborhood for 20 years",
+  family_ties = "Most extended family live in the neighborhood"
+)
+
+carpetbagger_profile <- tibble(
+  education = "Bachelor's degree",
+  race = "White",
+  gender = "Female",
+  political_experience = "Congress",
+  birthplace = "Not born in the neighborhood",
+  residence = "Rents a house in the neighborhood",
+  residence_length_as_adult = "Just moved to the neighborhood",
+  family_ties = "No extended family live in the neighborhood"
+)
+
+carpetbagger_profile_male <- tibble(
+  education = "Bachelor's degree",
+  race = "White",
+  gender = "Male",
+  political_experience = "Congress",
+  birthplace = "Not born in the neighborhood",
+  residence = "Rents a house in the neighborhood",
+  residence_length_as_adult = "Just moved to the neighborhood",
+  family_ties = "No extended family live in the neighborhood"
+)
+
+pp <- predictions(
+  fit_q1,
+  newdata = bind_rows(local_profile, carpetbagger_profile, carpetbagger_profile_male) |>
+            mutate(profile = c("Local", "Carpetbagger", "Carpetbagger (male)")),
+  type = "response",
+  vcov = ~ responseid
+)
+pp
+```
+
+<br />
+
+### Figure 2 and Table A.13: Marginal means by expressed place identity
+
+```{r, MM descriptive}
+# Control condition only. Identity = agree or strongly agree on the belonging item
+mm_data_control <- mm_data %>%
+  filter(treatment_group == FALSE) %>%
+  mutate(across(all_of(variable_names), likert_code)) %>%
+  mutate(
+    manipulation_check_1_bi = case_when(
+      manipulation_check_1 == 4 | manipulation_check_1 == 5 ~ 1,
+      manipulation_check_1 < 4 ~ 0
+    ),
+    identity = factor(manipulation_check_1_bi, levels = c(0, 1), labels = c("No identity", "Identity"))
+  )
+
+mm_identity <- cj(
+  data = filter(mm_data_control, manipulation_check_1_bi == 1),
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm"
+)
+
+mm_no_identity <- cj(
+  data = filter(mm_data_control, manipulation_check_1_bi == 0),
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm"
+)
+
+# Table A.13: identity minus no identity, SEs clustered on respondent
+mm_identity_diff <- cj(
+  data = filter(mm_data_control, !is.na(identity)),
+  formula = chosen ~ education + race + family_ties +
+    birthplace + residence + residence_length_as_adult + gender + political_experience,
+  id = ~responseid,
+  estimate = "mm_diff",
+  by = ~identity
+)
+stopifnot(all(mm_identity_diff$BY == "Identity - No identity"))
+table(mm_data_control$identity[!duplicated(mm_data_control$responseid)])
+mm_identity %>% select(feature, level, estimate, std.error)
+mm_no_identity %>% select(feature, level, estimate, std.error)
+mm_identity_diff %>% select(feature, level, estimate, std.error, p)
+
+# Figure 2: local attributes only
+mm_desc_plot_data <- bind_rows(
+  mutate(mm_identity, group = "Expresses place identity"),
+  mutate(mm_no_identity, group = "Does not express place identity")
+) %>%
+  filter(feature %in% c("family_ties", "birthplace", "residence", "residence_length_as_adult")) %>%
+  mutate(
+    Attribute = factor(dplyr::recode(as.character(feature),
+      family_ties = "Family ties", birthplace = "Birthplace",
+      residence = "Homeownership", residence_length_as_adult = "Length of residence"
+    ), levels = c("Family ties", "Birthplace", "Homeownership", "Length of residence")),
+    label = dplyr::recode(as.character(level),
+      "Not born" = "Not born in neighborhood", "Born" = "Born in neighborhood", "Owns" = "Owns house"
+    ),
+    label = factor(label, levels = rev(c(
+      "No extended family", "Some extended family", "Most extended family",
+      "Not born in neighborhood", "Born in neighborhood", "Rents", "Owns house",
+      "Just moved", "Lived 5 years", "Lived 20 years"
+    ))),
+    group = factor(group, levels = c("Expresses place identity", "Does not express place identity"))
+  )
+stopifnot(!any(is.na(mm_desc_plot_data$label)), nrow(mm_desc_plot_data) == 20)
+
+ggplot(mm_desc_plot_data, aes(x = estimate, y = label, shape = group, group = fct_rev(group))) +
+  geom_vline(xintercept = 0.5, colour = "grey60", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0, linewidth = 0.5, position = position_dodge(width = 0.6)) +
+  geom_point(size = 2.2, fill = "white", position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(16, 17), name = NULL) +
+  ggforce::facet_col(vars(Attribute), scales = "free_y", space = "free") +
+  labs(x = "Marginal mean", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.text = element_text(colour = "black"),
+    legend.position = "bottom"
+  )
+
+ggsave("mm_overall_q1_desc.pdf", width = 6, height = 5.5, units = "in")
+ggsave("mm_overall_q1_desc.png", width = 6, height = 5.5, units = "in", dpi = 600, bg = "white")
+```
+
+<br />
+
+### Table 2 and Table A.14: Treatment interactions
+
+```{r, interactions by treatment}
+# Treatment interacted with every attribute. Each interaction is the change in that attribute's effect under the prime
+# Model 1 (primary): exclusions, rounds 1-2
+interaction_m1 <- lm_robust(
+  formula = chosen ~ treatment_group * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1_restricted_r12,
+  clusters = responseid
+)
+
+# Model 2: exclusions, all rounds
+interaction_m2 <- lm_robust(
+  formula = chosen ~ treatment_group * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1_restricted,
+  clusters = responseid
+)
+
+# Model 3: no exclusions, rounds 1-2
+interaction_m3 <- lm_robust(
+  formula = chosen ~ treatment_group * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1_full_r12,
+  clusters = responseid
+)
+
+# Model 4: no exclusions, all rounds
+stopifnot(n_distinct(all_long_q1$responseid) == nrow(exp_data))
+interaction_m4 <- lm_robust(
+  formula = chosen ~ treatment_group * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1,
+  clusters = responseid
+)
+
+texreg(list(interaction_m1, interaction_m2, interaction_m3, interaction_m4), single.row = T, include.ci = FALSE, digits = 3)
+
+# Family ties: most minus some extended family, and any family against none (mean of the two interactions)
+some_family <- "treatment_groupTRUE:family_tiesSome extended family live in the neighborhood"
+most_family <- "treatment_groupTRUE:family_tiesMost extended family live in the neighborhood"
+family_contrasts <- function(m) {
+  stopifnot(all(c(some_family, most_family) %in% names(coef(m))))
+  b <- coef(m)
+  V <- vcov(m)
+  diff <- b[most_family] - b[some_family]
+  diff_se <- sqrt(V[most_family, most_family] + V[some_family, some_family] - 2 * V[most_family, some_family])
+  any <- (b[most_family] + b[some_family]) / 2
+  any_se <- sqrt(V[most_family, most_family] + V[some_family, some_family] + 2 * V[most_family, some_family]) / 2
+  tibble(
+    most_minus_some = diff, se_diff = diff_se, p_diff = 2 * pnorm(-abs(diff / diff_se)),
+    any_vs_none = any, se_any = any_se, p_any = 2 * pnorm(-abs(any / any_se))
+  )
+}
+map_dfr(list(`Model 1` = interaction_m1, `Model 2` = interaction_m2, `Model 3` = interaction_m3, `Model 4` = interaction_m4), family_contrasts, .id = "model")
+```
+
+<br />
+
+### Table A.15: Omnibus tests
+
+```{r, omnibus tests}
+# Omnibus tests (Leeper, Hobolt and Tilley 2020) as Wald tests, SEs clustered on respondent
+# Local interactions, non-local interactions, and all treatment terms
+local_attrs <- "family_ties + birthplace + residence_length_as_adult + residence"
+nonlocal_attrs <- "education + race + gender + political_experience"
+
+omnibus_test <- function(data) {
+  stopifnot(all(c("chosen", "treatment_group", "responseid") %in% names(data)))
+  full <- lm_robust(as.formula(paste("chosen ~ (", local_attrs, "+", nonlocal_attrs, ") * treatment_group")),
+    data = data, clusters = responseid
+  )
+  b <- coef(full)
+  V <- vcov(full)
+  treat_terms <- grep("treatment_groupTRUE", names(b), value = TRUE)
+  interactions <- setdiff(treat_terms, "treatment_groupTRUE")
+  local_terms <- interactions[str_detect(interactions, "family_ties|birthplace|residence")]
+  nonlocal_terms <- setdiff(interactions, local_terms)
+  stopifnot(length(local_terms) == 6, length(nonlocal_terms) == 6, length(treat_terms) == 13)
+  wald <- function(coefs, label) {
+    k <- length(coefs)
+    chisq <- as.numeric(t(b[coefs]) %*% solve(V[coefs, coefs]) %*% b[coefs])
+    tibble(terms = label, df = k, chisq = chisq, p.value = pchisq(chisq, k, lower.tail = FALSE))
+  }
+  bind_rows(
+    wald(local_terms, "Local"),
+    wald(nonlocal_terms, "Non-local"),
+    wald(treat_terms, "All attributes")
+  ) %>%
+    mutate(n_obs = nobs(full), n_respondents = n_distinct(data$responseid))
+}
+
+bind_rows(
+  omnibus_test(all_long_q1_restricted_r12) %>% mutate(model = "Model 1 (primary): exclusions, rounds 1-2"),
+  omnibus_test(all_long_q1_restricted) %>% mutate(model = "Model 2: exclusions, all rounds"),
+  omnibus_test(all_long_q1_full_r12) %>% mutate(model = "Model 3: no exclusions, rounds 1-2"),
+  omnibus_test(all_long_q1) %>% mutate(model = "Model 4: no exclusions, all rounds")
+)
+```
+
+<br />
+
+### Table A.16: Treatment interactions by party
+
+```{r, interactions by party}
+# Three-way: treatment x party (reference Neither) x attribute
+interaction_party <- lm_robust(
+  formula = chosen ~ treatment_group * pid_lean * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1_restricted_r12,
+  clusters = responseid
+)
+
+texreg(interaction_party, single.row = T, include.ci = FALSE)
+```
+
+<br />
+
+### Table A.17: Treatment interactions by urbanization
+
+```{r, interactions by urbanization}
+# Three-way: treatment x urbanicity (reference Rural) x attribute
+interaction_urban <- lm_robust(
+  formula = chosen ~ treatment_group * rural_urban_simplified * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = all_long_q1_restricted_r12,
+  clusters = responseid
+)
+
+texreg(interaction_urban, single.row = T, include.ci = FALSE)
+```
+
+<br />
+
+### Table A.18: Treatment interactions by task
+
+```{r, interactions by task}
+# Both tasks stacked. Three-way terms show whether the prime moves electability (q2) differently from preference (q1)
+interaction_task <- lm_robust(
+  formula = chosen ~ task * treatment_group * (education + race + family_ties + birthplace + residence + residence_length_as_adult +
+    gender + political_experience),
+  data = all_long_restricted_r12,
+  clusters = responseid
+)
+
+texreg(interaction_task, single.row = T, include.ci = FALSE)
+```
+
+<br />
+
+### Table A.19: Treatment interactions by conjoint round
+
+```{r, interactions by round}
+# Model 2 (exclusions) estimated separately for each round
+interaction_by_round <- map(1:3, function(r) {
+  lm_robust(
+    formula = chosen ~ treatment_group * (family_ties +
+      birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+    ),
+    data = filter(all_long_q1_restricted, round == r),
+    clusters = responseid
+  )
+})
+
+texreg(interaction_by_round, custom.model.names = c("Round 1", "Round 2", "Round 3"), single.row = T, include.ci = FALSE)
+
+# Joint Wald test of the six local interactions in each round, and pooled
+wald_local <- function(model, pattern = "^treatment_groupTRUE:(family|birth|residence)") {
+  terms <- str_subset(names(coef(model)), pattern)
+  stopifnot(length(terms) == 6)
+  b <- coef(model)[terms]
+  w <- as.numeric(t(b) %*% solve(vcov(model)[terms, terms]) %*% b)
+  c(chisq = w, df = 6, p = pchisq(w, 6, lower.tail = FALSE))
+}
+rbind(
+  "Round 1" = wald_local(interaction_by_round[[1]]),
+  "Round 2" = wald_local(interaction_by_round[[2]]),
+  "Round 3" = wald_local(interaction_by_round[[3]]),
+  "Rounds 1-2 (Model 1)" = wald_local(interaction_m1),
+  "Rounds 1-3 (Model 2)" = wald_local(interaction_m2)
+)
+
+# Mean of the six local interactions by round
+sapply(interaction_by_round, function(m) mean(coef(m)[str_subset(names(coef(m)), "^treatment_groupTRUE:(family|birth|residence)")]))
+
+# Where to cut: do the local interactions in round 2 differ from round 1, and in round 3 from rounds 1-2?
+round_test <- function(data) {
+  lm_robust(
+    formula = chosen ~ later * treatment_group * (family_ties +
+      birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+    ),
+    data = data,
+    clusters = responseid
+  )
+}
+wald_local(round_test(all_long_q1_restricted %>% filter(round <= 2) %>% mutate(later = round == 2)), "^laterTRUE:treatment_groupTRUE:(family|birth|residence)")
+wald_local(round_test(all_long_q1_restricted %>% mutate(later = round == 3)), "^laterTRUE:treatment_groupTRUE:(family|birth|residence)")
+```
+
+<br />
+
+### Tables A.20 and A.21: Open-text coding
+
+```{r, open text}
+# Coded treatment reflections, in the data file
+# llm_code: PI place identity, PD place dependence, MX mixed, UNUSABLE (prompt in opentext_coding_prompt.txt)
+# negative: 1 if the reflection says people live there despite the area or for lack of alternatives
+# human_code, human_negative: hand-coded validation sample, NA otherwise
+stopifnot(all(c("llm_code", "negative", "human_code", "human_negative") %in% names(exp_data)))
+stopifnot(all(!is.na(exp_data$llm_code) == exp_data$treatment_group))
+stopifnot(all(exp_data$llm_code %in% c("PI", "PD", "MX", "UNUSABLE", NA)), all(exp_data$negative %in% c(0, 1, NA)))
+
+# Table A.20: validation against hand-coded sample
+validation <- exp_data %>% filter(!is.na(human_code))
+stopifnot(all(validation$treatment_group), all(validation$human_code %in% c("PI", "PD", "MX", "UNUSABLE")))
+nrow(validation)
+sum(validation$responseid %in% exp_data_restricted$responseid)
+
+agreement <- table(
+  human = factor(validation$human_code, levels = c("PI", "PD", "MX", "UNUSABLE")),
+  llm = factor(validation$llm_code, levels = c("PI", "PD", "MX", "UNUSABLE"))
+)
+agreement
+
+cohen_kappa <- function(tbl) {
+  p_obs <- sum(diag(tbl)) / sum(tbl)
+  p_exp <- sum(rowSums(tbl) * colSums(tbl)) / sum(tbl)^2
+  c(agreement = p_obs, kappa = (p_obs - p_exp) / (1 - p_exp))
+}
+cohen_kappa(agreement)
+
+# PI against PD, responses both coders put in PI or PD
+cohen_kappa(agreement[c("PI", "PD"), c("PI", "PD")])
+
+# Negative flag
+agreement_negative <- table(human = validation$human_negative, llm = validation$negative)
+agreement_negative
+cohen_kappa(agreement_negative)
+
+# Table A.21: distribution, after exclusions
+opentext_restricted <- exp_data_restricted %>% filter(treatment_group)
+opentext_restricted %>%
+  count(llm_code) %>%
+  mutate(percent = n / sum(n) * 100)
+
+# Any place-identity content (PI or MX)
+mean(opentext_restricted$llm_code %in% c("PI", "MX")) * 100
+
+# Negative responses
+table(opentext_restricted$llm_code, opentext_restricted$negative)
+
+```
+
+<br />
+
+### Table A.22: Number of place-identity and place-dependence claims
+
+```{r, open text claims}
+# pi_claims, pd_claims: number of distinct PI and PD claims in each treatment reflection (same prompt, follow-up)
+stopifnot(all(c("pi_claims", "pd_claims") %in% names(exp_data)))
+stopifnot(all(!is.na(exp_data$pi_claims) == exp_data$treatment_group), all(!is.na(exp_data$pd_claims) == exp_data$treatment_group))
+stopifnot(all(exp_data$pi_claims >= 0, na.rm = T), all(exp_data$pd_claims >= 0, na.rm = T))
+
+# Consistency with llm_code, after exclusions
+opentext_restricted %>%
+  group_by(llm_code) %>%
+  summarise(
+    n = n(),
+    pi_more = mean(pi_claims > pd_claims),
+    pd_more = mean(pd_claims > pi_claims),
+    pi_claims = mean(pi_claims),
+    pd_claims = mean(pd_claims)
+  )
+
+# Joint Wald test on the local attribute terms
+wald_test <- function(model, pattern, k) {
+  terms <- str_subset(names(coef(model)), pattern)
+  stopifnot(length(terms) == k)
+  b <- coef(model)[terms]
+  w <- as.numeric(t(b) %*% solve(vcov(model)[terms, terms]) %*% b)
+  c(chisq = w, df = k, p = pchisq(w, k, lower.tail = FALSE))
+}
+
+# Attribute effects by number of PI and PD claims, treated respondents only
+interaction_claims <- lm_robust(
+  formula = chosen ~ (pi_claims + pd_claims) * (family_ties +
+    birthplace + residence_length_as_adult + residence + education + race + gender + political_experience
+  ),
+  data = filter(all_long_q1_restricted_r12, treatment_group),
+  clusters = responseid
+)
+
+texreg(interaction_claims, single.row = T, include.ci = FALSE)
+wald_test(interaction_claims, "^pi_claims:(family|birth|residence)", 6)
+wald_test(interaction_claims, "^pd_claims:(family|birth|residence)", 6)
+```
+
+<br />
+
+# Session info
+
+```{r}
+sessionInfo()
+```
